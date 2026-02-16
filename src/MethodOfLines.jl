@@ -131,6 +131,7 @@ include("discretization/staggered_discretize.jl")
 
 # Main
 include("scalar_discretization.jl")
+include("array_discretization.jl")
 include("MOL_discretization.jl")
 
 ## PrecompileTools
@@ -139,6 +140,6 @@ include("precompile.jl")
 # Export
 export MOLFiniteDifference, discretize, symbolic_discretize, ODEFunctionExpr, generate_code,
     grid_align, edge_align, center_align, get_discrete, chebyspace
-export UpwindScheme, WENOScheme, FunctionalScheme, MOLDiscCallback
+export UpwindScheme, WENOScheme, FunctionalScheme, MOLDiscCallback, ArrayDiscretization
 
 end
