@@ -195,16 +195,40 @@ function build_upwind_stencil_matrix(
 end
 
 """
-    compute_derivative_vectors(stencil_matrices, s)
+    apply_stencil_along_dim(L, u_scalarized, j, ndim)
 
-Compute the derivative vectors for all dependent variables and derivative orders
+Apply a stencil matrix `L` along dimension `j` of a multi-dimensional symbolic array.
+
+For 1D: `L * u_vec` (standard matrix-vector product)
+For 2D, dim 1: `L * u_mat` (applies to each column)
+For 2D, dim 2: `u_mat * transpose(L)` (applies to each row)
+"""
+function apply_stencil_along_dim(L, u_scalarized, j, ndim)
+    if ndim <= 1
+        return L * u_scalarized
+    elseif ndim == 2
+        if j == 1
+            return L * u_scalarized
+        else  # j == 2
+            return u_scalarized * transpose(L)
+        end
+    else
+        error("Stencil matrices for >2 spatial dimensions not yet supported, got ndim=$ndim")
+    end
+end
+
+"""
+    compute_derivative_vectors(stencil_matrices, s, depvars)
+
+Compute the derivative arrays for all dependent variables and derivative orders
 by multiplying stencil matrices with scalarized symbolic array variables.
 
 Returns a nested dictionary:
-  `deriv_vecs[uop][Differential(x)^d]` → `Vector{Num}` (for centered derivatives)
-  `deriv_vecs[uop][Differential(x)^d]` → `(Vector{Num}, Vector{Num})` (for upwind: fwd, bwd)
+  `deriv_vecs[u][Differential(x)^d]` → array of `Num` (for centered derivatives)
+  `deriv_vecs[u][Differential(x)^d]` → `(array, array)` (for upwind: fwd, bwd)
 
-Each vector element `i` contains the symbolic expression for the derivative at grid point `i`.
+Each element at index `(i,j,...)` contains the symbolic expression for the derivative
+at that grid point. The arrays have the same shape as the discretized variable.
 """
 function compute_derivative_vectors(stencil_matrices, s, depvars)
     deriv_vecs = Dict()
@@ -216,15 +240,19 @@ function compute_derivative_vectors(stencil_matrices, s, depvars)
         u_arr = s.disc_arrays[u]
         u_arr === nothing && continue  # skip ODE-only variables
         u_scalarized = collect(u_arr)
+        ndim = ndims(u, s)
 
-        for (diff_op, mat) in u_matrices
-            if mat isa Tuple
-                # Upwind: (L_fwd, L_bwd)
-                L_fwd, L_bwd = mat
-                u_dvecs[diff_op] = (L_fwd * u_scalarized, L_bwd * u_scalarized)
+        for (diff_op, mat_with_dim) in u_matrices
+            if mat_with_dim[1] isa Tuple
+                # Upwind: ((L_fwd, L_bwd), j)
+                (L_fwd, L_bwd), j = mat_with_dim
+                dvec_fwd = apply_stencil_along_dim(L_fwd, u_scalarized, j, ndim)
+                dvec_bwd = apply_stencil_along_dim(L_bwd, u_scalarized, j, ndim)
+                u_dvecs[diff_op] = (dvec_fwd, dvec_bwd)
             else
-                # Centered: single matrix
-                u_dvecs[diff_op] = mat * u_scalarized
+                # Centered: (L, j)
+                L, j = mat_with_dim
+                u_dvecs[diff_op] = apply_stencil_along_dim(L, u_scalarized, j, ndim)
             end
         end
         deriv_vecs[u] = u_dvecs
@@ -236,11 +264,11 @@ end
     build_stencil_matrices(s, depvars, derivweights, bcmap)
 
 Build all stencil matrices for all dependent variables and derivative orders.
-Returns a nested dictionary: `matrices[u][Differential(x)^d] => sparse matrix L`.
+Returns a nested dictionary:
+  `matrices[uop][Differential(x)^d] => (L, j)` for centered derivatives
+  `matrices[uop][Differential(x)^d] => ((L_fwd, L_bwd), j)` for upwind derivatives
 
-For centered (even order) derivatives, a single matrix is returned.
-For upwind (odd order) derivatives, two matrices are returned:
-`(L_pos, L_neg)` for positive and negative wind directions.
+where `j` is the spatial dimension index that the stencil operates on.
 """
 function build_stencil_matrices(s, depvars, derivweights, bcmap)
     matrices = Dict()
@@ -252,13 +280,14 @@ function build_stencil_matrices(s, depvars, derivweights, bcmap)
         for x in ivs(u, s)
             gridlen = length(s, x)
             bs = filter_interfaces(bcmap[uop][x])
+            j = x2i(s, u, x)
 
             # Centered (even order) derivatives
             for d in derivweights.orders[x]
                 if iseven(d)
                     D_op = derivweights.map[Differential(x)^d]
                     L = build_centered_stencil_matrix(D_op, gridlen, bs, x)
-                    u_matrices[Differential(x)^d] = L
+                    u_matrices[Differential(x)^d] = (L, j)
                 end
             end
 
@@ -273,7 +302,7 @@ function build_stencil_matrices(s, depvars, derivweights, bcmap)
                     D_bwd = derivweights.windmap[2][Differential(x)^d]
                     L_bwd = build_upwind_stencil_matrix(D_bwd, gridlen, bs, x, false)
 
-                    u_matrices[Differential(x)^d] = (L_fwd, L_bwd)
+                    u_matrices[Differential(x)^d] = ((L_fwd, L_bwd), j)
                 end
             end
         end

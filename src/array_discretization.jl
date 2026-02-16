@@ -4,16 +4,18 @@ Array-level equation discretization using stencil matrices.
 Instead of computing per-point stencil weights, this approach:
 1. Builds sparse stencil matrices for each derivative operator
 2. Computes all derivative values at once via matrix-vector multiplication
-3. Assembles per-point equations by indexing into the pre-computed vectors
+3. Assembles per-point equations by indexing into the pre-computed arrays
 
 This is mathematically equivalent to the scalar approach but avoids
-redundant per-point stencil weight computation.
+redundant per-point stencil weight computation. For derivative schemes
+not covered by stencil matrices (e.g., WENO, nonlinear Laplacian),
+falls back to per-point scalar computation.
 """
 function PDEBase.discretize_equation!(
         disc_state::PDEBase.EquationState, pde::Equation, interiormap,
         eqvar, bcmap, depvars, s::DiscreteSpace, derivweights, indexmap,
         discretization::MOLFiniteDifference{G, D}
-    ) where {G, D <: ArrayDiscretization}
+    ) where {G, D}
 
     # Handle boundary values
     boundaryvalfuncs = generate_boundary_val_funcs(
@@ -58,9 +60,13 @@ end
     discretize_equation_at_point_array(II, s, depvars, pde, derivweights, bcmap,
         eqvar, indexmap, boundaryvalfuncs, deriv_vecs)
 
-Discretize a PDE at a single grid point using pre-computed derivative vectors.
+Discretize a PDE at a single grid point using pre-computed derivative arrays.
 Derivative values are looked up from `deriv_vecs` instead of being computed
 per-point via stencil weights.
+
+For derivative schemes not covered by stencil matrices (WENO, nonlinear Laplacian,
+spherical Laplacian, mixed derivatives), falls back to per-point scalar computation
+via `generate_finite_difference_rules`.
 """
 function discretize_equation_at_point_array(
         II, s, depvars, pde, derivweights, bcmap, eqvar, indexmap,
@@ -68,20 +74,26 @@ function discretize_equation_at_point_array(
     )
     boundaryrules = mapreduce(f -> f(II), vcat, boundaryvalfuncs, init = [])
 
-    # Build derivative rules from pre-computed derivative vectors
-    deriv_rules = generate_array_deriv_rules(
+    # Build derivative rules from pre-computed derivative arrays (array approach)
+    array_deriv_rules = generate_array_deriv_rules(
         II, s, depvars, derivweights, bcmap, indexmap, pde, deriv_vecs
+    )
+
+    # Scalar fallback for any derivatives not covered by stencil matrices
+    scalar_rules = generate_finite_difference_rules(
+        II, s, depvars, pde, derivweights, bcmap, indexmap
     )
 
     # Variable value and coordinate rules (same as scalar approach)
     val_rules = valmaps(s, eqvar, depvars, II, indexmap)
 
-    rules = vcat(deriv_rules, boundaryrules, val_rules)
+    # Array rules take priority (prepended); scalar rules are fallback
+    rules = vcat(array_deriv_rules, boundaryrules, scalar_rules, val_rules)
 
     try
         return expand_derivatives(mol_substitute(pde.lhs, rules)) ~ mol_substitute(pde.rhs, rules)
     catch e
-        println("Array discretization failed for equation: $pde at index $II.\n")
+        println("Discretization failed for equation: $pde at index $II.\n")
         println("The following rules were constructed:")
         display(rules)
         rethrow(e)
@@ -91,9 +103,12 @@ end
 """
     generate_array_deriv_rules(II, s, depvars, derivweights, bcmap, indexmap, pde, deriv_vecs)
 
-Generate substitution rules for derivative terms using pre-computed derivative vectors.
-For centered derivatives: `Differential(x)^d(u) => deriv_vecs[u][Diff(x)^d][i]`
+Generate substitution rules for derivative terms using pre-computed derivative arrays.
+For centered derivatives: `Differential(x)^d(u) => deriv_arr[u][Diff(x)^d][i,j,...]`
 For upwind derivatives: generates IfElse rules based on advection coefficient sign.
+
+Uses the full multi-dimensional index to correctly look up derivative values in
+multi-dimensional arrays.
 """
 function generate_array_deriv_rules(
         II, s, depvars, derivweights, bcmap, indexmap, pde, deriv_vecs
@@ -103,17 +118,15 @@ function generate_array_deriv_rules(
     for u in depvars
         haskey(deriv_vecs, u) || continue
         u_dvecs = deriv_vecs[u]
+        idx = Idx(II, s, u, indexmap)
 
         for x in ivs(u, s)
-            j = x2i(s, u, x)
-            idx = Idx(II, s, u, indexmap)
-
             # Centered (even order) derivative rules
             for d in derivweights.orders[x]
                 diff_op = Differential(x)^d
                 if iseven(d) && haskey(u_dvecs, diff_op)
-                    dvec = u_dvecs[diff_op]
-                    push!(rules, diff_op(u) => dvec[idx[j]])
+                    darr = u_dvecs[diff_op]
+                    push!(rules, diff_op(u) => darr[idx])
                 end
             end
 
@@ -122,9 +135,9 @@ function generate_array_deriv_rules(
             for d in derivweights.orders[x]
                 diff_op = Differential(x)^d
                 if isodd(d) && haskey(u_dvecs, diff_op)
-                    dvec_fwd, dvec_bwd = u_dvecs[diff_op]
+                    darr_fwd, darr_bwd = u_dvecs[diff_op]
                     # Default: use backward-biased (positive wind) direction
-                    push!(rules, diff_op(u) => dvec_bwd[idx[j]])
+                    push!(rules, diff_op(u) => darr_bwd[idx])
                 end
             end
         end
@@ -144,6 +157,8 @@ end
 Generate IfElse-based upwind rules for terms where an odd-order derivative is multiplied
 by a coefficient. If the coefficient is positive, use backward-biased stencil; if negative,
 use forward-biased stencil.
+
+Uses full multi-dimensional indexing for correct lookup in multi-dimensional derivative arrays.
 """
 function generate_array_winding_rules(
         II, s, depvars, derivweights, bcmap, indexmap, pde, deriv_vecs
@@ -154,16 +169,13 @@ function generate_array_winding_rules(
     for u in depvars
         haskey(deriv_vecs, u) || continue
         u_dvecs = deriv_vecs[u]
+        idx = Idx(II, s, u, indexmap)
 
         for x in ivs(u, s)
-            j = x2i(s, u, x)
-            idx = Idx(II, s, u, indexmap)
-
             for d in derivweights.orders[x]
                 diff_op = Differential(x)^d
                 if isodd(d) && haskey(u_dvecs, diff_op)
-                    dvec_fwd, dvec_bwd = u_dvecs[diff_op]
-                    i_grid = idx[j]
+                    darr_fwd, darr_bwd = u_dvecs[diff_op]
 
                     # Build rewriting rules to catch multiplication patterns
                     # coeff * Dx(u) → IfElse.ifelse(coeff > 0, coeff * bwd, coeff * fwd)
@@ -174,8 +186,8 @@ function generate_array_winding_rules(
                         )
                         IfElse.ifelse(
                             coeff_expr > 0,
-                            coeff_expr * dvec_bwd[i_grid],
-                            coeff_expr * dvec_fwd[i_grid]
+                            coeff_expr * darr_bwd[idx],
+                            coeff_expr * darr_fwd[idx]
                         )
                     end
 
@@ -186,8 +198,8 @@ function generate_array_winding_rules(
                         )
                         IfElse.ifelse(
                             coeff_expr > 0,
-                            coeff_expr * dvec_bwd[i_grid],
-                            coeff_expr * dvec_fwd[i_grid]
+                            coeff_expr * darr_bwd[idx],
+                            coeff_expr * darr_fwd[idx]
                         )
                     end
 

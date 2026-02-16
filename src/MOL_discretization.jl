@@ -11,8 +11,8 @@ function PDEBase.interface_errors(
     if !any(s -> discretization.advection_scheme isa s, [UpwindScheme, FunctionalScheme])
         throw(ArgumentError("Only `UpwindScheme()` and `FunctionalScheme()` are supported advection schemes. Got $(typeof(discretization.advection_scheme))."))
     end
-    return if !(typeof(discretization.disc_strategy) ∈ [ScalarizedDiscretization, ArrayDiscretization])
-        throw(ArgumentError("Only `ScalarizedDiscretization()` and `ArrayDiscretization()` are supported discretization strategies."))
+    return if !(discretization.disc_strategy isa AbstractDiscretizationStrategy)
+        throw(ArgumentError("Discretization strategy must be an `AbstractDiscretizationStrategy`, got $(typeof(discretization.disc_strategy))."))
     end
 end
 
