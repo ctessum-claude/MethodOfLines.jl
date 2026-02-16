@@ -195,6 +195,44 @@ function build_upwind_stencil_matrix(
 end
 
 """
+    compute_derivative_vectors(stencil_matrices, s)
+
+Compute the derivative vectors for all dependent variables and derivative orders
+by multiplying stencil matrices with scalarized symbolic array variables.
+
+Returns a nested dictionary:
+  `deriv_vecs[uop][Differential(x)^d]` → `Vector{Num}` (for centered derivatives)
+  `deriv_vecs[uop][Differential(x)^d]` → `(Vector{Num}, Vector{Num})` (for upwind: fwd, bwd)
+
+Each vector element `i` contains the symbolic expression for the derivative at grid point `i`.
+"""
+function compute_derivative_vectors(stencil_matrices, s, depvars)
+    deriv_vecs = Dict()
+    for u in depvars
+        uop = operation(u)
+        haskey(stencil_matrices, uop) || continue
+        u_matrices = stencil_matrices[uop]
+        u_dvecs = Dict()
+        u_arr = s.disc_arrays[u]
+        u_arr === nothing && continue  # skip ODE-only variables
+        u_scalarized = collect(u_arr)
+
+        for (diff_op, mat) in u_matrices
+            if mat isa Tuple
+                # Upwind: (L_fwd, L_bwd)
+                L_fwd, L_bwd = mat
+                u_dvecs[diff_op] = (L_fwd * u_scalarized, L_bwd * u_scalarized)
+            else
+                # Centered: single matrix
+                u_dvecs[diff_op] = mat * u_scalarized
+            end
+        end
+        deriv_vecs[u] = u_dvecs
+    end
+    return deriv_vecs
+end
+
+"""
     build_stencil_matrices(s, depvars, derivweights, bcmap)
 
 Build all stencil matrices for all dependent variables and derivative orders.
