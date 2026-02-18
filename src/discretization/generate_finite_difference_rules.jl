@@ -115,6 +115,73 @@ function generate_finite_difference_rules(
     )
 end
 
+"""
+`generate_special_finite_difference_rules`
+
+Lightweight variant of `generate_finite_difference_rules` that generates ONLY
+the rules not already covered by stencil matrices. This omits the expensive
+`generate_cartesian_rules` and `generate_winding_rules` calls, which are O(N)
+per grid point and redundant when stencil matrices handle standard derivatives.
+
+Rules included: FunctionalScheme advection (e.g. WENO), mixed derivatives,
+nonlinear Laplacian, spherical diffusion, callback rules, and integration rules.
+"""
+function generate_special_finite_difference_rules(
+        II::CartesianIndex, s::DiscreteSpace, depvars, pde::Equation,
+        derivweights::DifferentialDiscretizer, bmap, indexmap
+    )
+    terms = split_terms(pde, s.x̄)
+    if length(II) != 0
+        # Mixed derivative rules (not covered by stencil matrices)
+        mixed_deriv_rules_cartesian = generate_mixed_rules(
+            II, s, depvars, derivweights, bmap, indexmap, terms
+        )
+
+        # FunctionalScheme advection (e.g. WENO) — not covered by stencil matrices
+        # Standard UpwindScheme advection IS covered by stencil matrices, so skip it
+        if derivweights.advection_scheme isa FunctionalScheme
+            advection_rules = generate_advection_rules(
+                derivweights.advection_scheme, II, s,
+                depvars, derivweights, bmap, indexmap, terms
+            )
+        else
+            advection_rules = []
+        end
+
+        # Nonlinear laplacian scheme
+        nonlinlap_rules = generate_nonlinlap_rules(
+            II, s, depvars, derivweights, bmap, indexmap, terms
+        )
+
+        # Spherical diffusion scheme
+        spherical_diffusion_rules = generate_spherical_diffusion_rules(
+            II, s, depvars, derivweights, bmap, indexmap, split_additive_terms(pde)
+        )
+        integration_rules = vec(
+            generate_euler_integration_rules(
+                II, s, depvars, indexmap, terms
+            )
+        )
+    else
+        nonlinlap_rules = []
+        spherical_diffusion_rules = []
+        mixed_deriv_rules_cartesian = []
+        advection_rules = []
+        integration_rules = []
+    end
+
+    cb_rules = generate_cb_rules(II, s, depvars, derivweights, bmap, indexmap, terms)
+
+    integration_rules = vcat(
+        integration_rules,
+        vec(generate_whole_domain_integration_rules(II, s, depvars, indexmap, terms))
+    )
+    return vcat(
+        cb_rules, vec(spherical_diffusion_rules), vec(nonlinlap_rules),
+        vec(mixed_deriv_rules_cartesian), vec(advection_rules), integration_rules
+    )
+end
+
 function generate_finite_difference_rules(
         II::CartesianIndex, s::DiscreteSpace{W, M, G}, depvars,
         pde::Equation, derivweights::DifferentialDiscretizer,

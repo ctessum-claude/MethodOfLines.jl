@@ -237,9 +237,11 @@ function compute_derivative_vectors(stencil_matrices, s, depvars)
         haskey(stencil_matrices, uop) || continue
         u_matrices = stencil_matrices[uop]
         u_dvecs = Dict()
-        u_arr = s.disc_arrays[u]
-        u_arr === nothing && continue  # skip ODE-only variables
-        u_scalarized = collect(u_arr)
+        u_dep = depvar(u, s)
+        haskey(s.discvars, u_dep) || continue
+        u_scalarized_raw = s.discvars[u_dep]
+        ndims(u_scalarized_raw) == 0 && continue  # skip ODE-only variables
+        u_scalarized = u_scalarized_raw
         ndim = ndims(u, s)
 
         for (diff_op, mat_with_dim) in u_matrices

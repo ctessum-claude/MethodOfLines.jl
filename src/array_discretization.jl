@@ -65,8 +65,8 @@ Derivative values are looked up from `deriv_vecs` instead of being computed
 per-point via stencil weights.
 
 For derivative schemes not covered by stencil matrices (WENO, nonlinear Laplacian,
-spherical Laplacian, mixed derivatives), falls back to per-point scalar computation
-via `generate_finite_difference_rules`.
+spherical Laplacian, mixed derivatives), falls back to per-point computation
+via `generate_special_finite_difference_rules`.
 """
 function discretize_equation_at_point_array(
         II, s, depvars, pde, derivweights, bcmap, eqvar, indexmap,
@@ -79,16 +79,17 @@ function discretize_equation_at_point_array(
         II, s, depvars, derivweights, bcmap, indexmap, pde, deriv_vecs
     )
 
-    # Scalar fallback for any derivatives not covered by stencil matrices
-    scalar_rules = generate_finite_difference_rules(
+    # Special rules for derivatives not covered by stencil matrices
+    # (mixed derivatives, nonlinear Laplacian, spherical diffusion, callbacks, integration)
+    special_rules = generate_special_finite_difference_rules(
         II, s, depvars, pde, derivweights, bcmap, indexmap
     )
 
     # Variable value and coordinate rules (same as scalar approach)
     val_rules = valmaps(s, eqvar, depvars, II, indexmap)
 
-    # Array rules take priority (prepended); scalar rules are fallback
-    rules = vcat(array_deriv_rules, boundaryrules, scalar_rules, val_rules)
+    # Array rules take priority (prepended); special rules cover edge cases
+    rules = vcat(array_deriv_rules, boundaryrules, special_rules, val_rules)
 
     try
         return expand_derivatives(mol_substitute(pde.lhs, rules)) ~ mol_substitute(pde.rhs, rules)
