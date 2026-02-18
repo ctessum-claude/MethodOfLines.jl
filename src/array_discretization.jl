@@ -37,12 +37,14 @@ function PDEBase.discretize_equation!(
 
     # Generate equations for all interior points
     eqs = if length(interior) == 0
+        # ODE variable — keep existing per-point path
         II = CartesianIndex()
         discretize_equation_at_point_array(
             II, s, depvars, pde, derivweights, bcmap, eqvar, indexmap,
             boundaryvalfuncs, deriv_vecs
         )
-    else
+    elseif needs_special_handling(pde, s, depvars, derivweights)
+        # Fallback — keep existing per-point loop for special cases
         vec(
             map(interior) do II
                 discretize_equation_at_point_array(
@@ -51,6 +53,9 @@ function PDEBase.discretize_equation!(
                 )
             end
         )
+    else
+        # FAST PATH — array-level discretization
+        arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
     end
 
     return vcat!(disc_state.eqs, eqs)
@@ -218,4 +223,392 @@ function generate_array_winding_rules(
     end
 
     return wind_rules
+end
+
+# ============================================================================
+# Array-level PDE discretization (fast path)
+# ============================================================================
+
+"""
+    needs_special_handling(pde, s, depvars, derivweights)
+
+Returns `true` if the PDE has features that cannot be handled at the array level
+and must fall back to the per-point loop. Detected special cases:
+- Nonlinear Laplacian patterns: `Dx(f(u)*Dx(u))`
+- Spherical diffusion patterns
+- Mixed derivatives: `Dxy(u)`
+- `FunctionalScheme` advection (e.g., WENO)
+- Integral terms
+- Callback rules
+"""
+function needs_special_handling(pde, s, depvars, derivweights)
+    # FunctionalScheme (e.g. WENO) not supported at array level
+    if derivweights.advection_scheme isa FunctionalScheme
+        return true
+    end
+
+    # Callbacks present
+    if length(derivweights.callbacks) > 0
+        return true
+    end
+
+    terms = split_terms(pde, s.x̄)
+
+    for u in depvars
+        for x in ivs(u, s)
+            # Check for nonlinear Laplacian: Dx(expr * Dx(u))
+            for t_term in terms
+                for nlap_rule in _nonlinlap_detect_rules(x, u)
+                    if nlap_rule(t_term) !== nothing
+                        return true
+                    end
+                end
+            end
+
+            # Check for spherical diffusion patterns
+            for t_term in split_additive_terms(pde)
+                for sph_rule in _spherical_detect_rules(x, u)
+                    if sph_rule(t_term) !== nothing
+                        return true
+                    end
+                end
+            end
+        end
+
+        # Check for mixed derivatives (two different spatial vars in one derivative chain)
+        for t_term in terms
+            if _has_mixed_derivatives(t_term, s)
+                return true
+            end
+        end
+    end
+
+    # Check for integral terms
+    for t_term in terms
+        if _has_integral(t_term)
+            return true
+        end
+    end
+
+    return false
+end
+
+# Detection rules for nonlinear Laplacian patterns
+function _nonlinlap_detect_rules(x, u)
+    return [
+        (@rule $(Differential(x))(*(~~a, $(Differential(x))(u), ~~b)) => true),
+        (@rule *(~~c, $(Differential(x))(*(~~a, $(Differential(x))(u), ~~b)), ~~d) => true),
+        (@rule $(Differential(x))($(Differential(x))(u) / ~a) => true),
+        (@rule *(~~b, $(Differential(x))($(Differential(x))(u) / ~a), ~~c) => true),
+        (@rule /(*(~~b, $(Differential(x))(*(~~a, $(Differential(x))(u), ~~d)), ~~c), ~e) => true),
+    ]
+end
+
+# Detection rules for spherical diffusion patterns (Dx(x^2 * Dx(u)) / x^2 and similar)
+function _spherical_detect_rules(x, u)
+    return [
+        (@rule /($(Differential(x))(*(~~a, $(Differential(x))(u), ~~b)), ~c) => true),
+    ]
+end
+
+# Check if a term contains mixed derivatives (Dx(Dy(u)))
+function _has_mixed_derivatives(term, s)
+    if !iscall(term)
+        return false
+    end
+    op = operation(term)
+    if op isa Differential
+        # Check if the inner argument also has a differential w.r.t. a DIFFERENT spatial var
+        inner = arguments(term)[1]
+        return _has_different_spatial_diff(inner, op.x, s)
+    else
+        return any(arg -> _has_mixed_derivatives(arg, s), arguments(term))
+    end
+end
+
+function _has_different_spatial_diff(term, outer_x, s)
+    if !iscall(term)
+        return false
+    end
+    op = operation(term)
+    if op isa Differential
+        # If this differential is w.r.t. a different spatial variable, it's a mixed derivative
+        if !isequal(op.x, outer_x) && any(x -> isequal(op.x, x), s.x̄)
+            return true
+        end
+        # Also check deeper
+        return _has_different_spatial_diff(arguments(term)[1], outer_x, s)
+    else
+        return any(arg -> _has_different_spatial_diff(arg, outer_x, s), arguments(term))
+    end
+end
+
+# Check if a term contains an Integral operator
+function _has_integral(term)
+    if !iscall(term)
+        return false
+    end
+    op = operation(term)
+    if op isa Integral
+        return true
+    end
+    return any(_has_integral, arguments(term))
+end
+
+"""
+    arrayify_expr(expr, s, depvars, deriv_vecs, derivweights, indexmap,
+                  interior_idxs, coord_vecs)
+
+Recursively walk the symbolic expression tree, replacing scalar symbolic atoms
+with array-valued counterparts (vectors over the interior grid points).
+
+Returns a `Vector{Num}` of length `length(interior_idxs)`.
+"""
+function arrayify_expr(expr, s, depvars, deriv_vecs, derivweights, indexmap,
+        interior_idxs, coord_vecs)
+    expr = unwrap(expr)
+
+    # Scalar constants / parameters / time variable — broadcast later
+    if !iscall(expr)
+        # Check if it's a spatial independent variable
+        for x in s.x̄
+            if isequal(expr, x)
+                return coord_vecs[x]
+            end
+        end
+        # Scalar: will be broadcast by caller
+        return expr
+    end
+
+    op = operation(expr)
+    args = arguments(expr)
+
+    # Differential operator (both time and spatial)
+    if op isa Differential
+        diff_x = op.x
+        d = op.order
+
+        # Time derivative: Dt(stuff) → Dt.(arrayified_stuff)
+        if s.time !== nothing && isequal(diff_x, s.time)
+            inner_arr = arrayify_expr(args[1], s, depvars, deriv_vecs, derivweights,
+                indexmap, interior_idxs, coord_vecs)
+            if inner_arr isa AbstractArray
+                return Differential(s.time).(inner_arr)
+            else
+                return Differential(s.time)(inner_arr)
+            end
+        end
+
+        # Spatial derivative: Dx^d(u) → look up from deriv_vecs
+        if any(sx -> isequal(sx, diff_x), s.x̄)
+            diff_op = Differential(diff_x)^d
+            innermost = args[1]
+
+            # Find which depvar this derivative acts on
+            for u in depvars
+                if _expr_matches_depvar(innermost, u, s)
+                    if haskey(deriv_vecs, u) && haskey(deriv_vecs[u], diff_op)
+                        dvec_entry = deriv_vecs[u][diff_op]
+                        if iseven(d)
+                            # Centered derivative: single array
+                            return dvec_entry[interior_idxs]
+                        else
+                            # Upwind derivative: (fwd, bwd) tuple, default to backward
+                            _, darr_bwd = dvec_entry
+                            return darr_bwd[interior_idxs]
+                        end
+                    end
+                end
+            end
+            # If we couldn't find the derivative in deriv_vecs, fall through to generic
+        end
+    end
+
+    # Dependent variable: u(t,x) → s.discvars[u][interior_idxs]
+    for u in depvars
+        if _expr_matches_depvar(expr, u, s)
+            u_dep = depvar(u, s)
+            return s.discvars[u_dep][interior_idxs]
+        end
+    end
+
+    # Generic operation: recursively arrayify arguments, then broadcast
+    arrayified_args = [arrayify_expr(a, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs) for a in args]
+
+    return _broadcast_op(op, arrayified_args)
+end
+
+"""
+Check if `expr` matches a dependent variable `u` (i.e., is u(t,x,...) or similar).
+"""
+function _expr_matches_depvar(expr, u, s)
+    expr = unwrap(expr)
+    if !iscall(expr)
+        return false
+    end
+    return isequal(operation(expr), operation(u))
+end
+
+"""
+Broadcast an operation over potentially array-valued arguments.
+If all arguments are scalar, return scalar. Otherwise broadcast.
+"""
+function _broadcast_op(op, args)
+    any_array = any(a -> a isa AbstractArray, args)
+    if !any_array
+        # All scalar
+        return op(args...)
+    end
+    # Broadcast
+    return broadcast(op, args...)
+end
+
+"""
+    arrayify_upwind_terms(pde, s, depvars, deriv_vecs, derivweights, indexmap,
+                          interior_idxs, coord_vecs)
+
+Identify terms of the form `coeff * Dx(u)` (odd-order derivatives multiplied by
+a coefficient) and produce array-level IfElse expressions for upwind differencing.
+
+Returns a `Dict` mapping matched symbolic terms to their array-level replacements.
+"""
+function arrayify_upwind_terms(pde, s, depvars, deriv_vecs, derivweights, indexmap,
+        interior_idxs, coord_vecs)
+    terms = split_terms(pde, s.x̄)
+    upwind_replacements = Dict{Any, Any}()
+
+    for u in depvars
+        haskey(deriv_vecs, u) || continue
+        u_dvecs = deriv_vecs[u]
+
+        for x in ivs(u, s)
+            for d in derivweights.orders[x]
+                diff_op = Differential(x)^d
+                if isodd(d) && haskey(u_dvecs, diff_op)
+                    darr_fwd, darr_bwd = u_dvecs[diff_op]
+                    fwd_vec = darr_fwd[interior_idxs]
+                    bwd_vec = darr_bwd[interior_idxs]
+
+                    # Pattern: *(~~a, Dx^d(u), ~~b)
+                    mult_rule = @rule *(~~a, $(diff_op)(u), ~~b) => begin
+                        coeff_subexpr = *(~a..., ~b...)
+                        coeff_subexpr
+                    end
+
+                    # Pattern: /(*(~~a, Dx^d(u), ~~b), ~c)
+                    div_rule = @rule /(*(~~a, $(diff_op)(u), ~~b), ~c) => begin
+                        coeff_subexpr = *(~a..., ~b...) / ~c
+                        coeff_subexpr
+                    end
+
+                    for t_term in terms
+                        for r in [mult_rule, div_rule]
+                            coeff_subexpr = r(t_term)
+                            if coeff_subexpr !== nothing
+                                # Arrayify the coefficient sub-expression
+                                coeff_vec = arrayify_expr(coeff_subexpr, s, depvars,
+                                    deriv_vecs, derivweights, indexmap,
+                                    interior_idxs, coord_vecs)
+                                if !(coeff_vec isa AbstractArray)
+                                    coeff_vec = fill(coeff_vec, length(fwd_vec))
+                                end
+                                result = IfElse.ifelse.(
+                                    coeff_vec .> 0,
+                                    coeff_vec .* bwd_vec,
+                                    coeff_vec .* fwd_vec
+                                )
+                                upwind_replacements[t_term] = result
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return upwind_replacements
+end
+
+"""
+    arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
+
+Top-level orchestrator for array-level PDE discretization. Converts the entire PDE
+into N scalar equations by operating on vectors of symbolic expressions rather than
+looping over grid points.
+
+Returns a `Vector{Equation}` of length equal to the number of interior points.
+"""
+function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
+    interior = interiormap.I[pde]
+    interior_idxs = vec(collect(interior))
+
+    # Build coordinate vectors at interior points (only for the eqvar's spatial vars)
+    coord_vecs = Dict{Any, Any}()
+    u_dep = depvar(eqvar, s)
+    for x in ivs(u_dep, s)
+        j = x2i(s, u_dep, x)
+        coord_vecs[x] = [Num(s.grid[x][II[j]]) for II in interior_idxs]
+    end
+
+    # Identify upwind terms (once, not per-point)
+    upwind_replacements = arrayify_upwind_terms(pde, s, depvars, deriv_vecs,
+        derivweights, indexmap, interior_idxs, coord_vecs)
+
+    # Split the equation into additive terms on LHS and RHS
+    lhs_vec = _arrayify_side(pde.lhs, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, upwind_replacements)
+    rhs_vec = _arrayify_side(pde.rhs, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, upwind_replacements)
+
+    n = length(interior_idxs)
+
+    # Ensure both sides are vectors
+    if !(lhs_vec isa AbstractArray)
+        lhs_vec = fill(lhs_vec, n)
+    end
+    if !(rhs_vec isa AbstractArray)
+        rhs_vec = fill(rhs_vec, n)
+    end
+
+    # Generate N scalar equations
+    return [expand_derivatives(lhs_vec[i]) ~ rhs_vec[i] for i in 1:n]
+end
+
+"""
+Arrayify one side of a PDE equation, handling upwind term replacement.
+
+For additive expressions (op is +), we check each additive sub-term against
+the upwind replacement dict. Matched terms get replaced; unmatched terms get
+recursively arrayified.
+"""
+function _arrayify_side(expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, upwind_replacements)
+    expr_unwrapped = unwrap(expr)
+
+    # Check if the entire expression matches an upwind term
+    for (term_key, replacement) in upwind_replacements
+        if isequal(expr_unwrapped, unwrap(term_key))
+            return replacement
+        end
+    end
+
+    # If it's an additive expression, check each sub-term
+    if iscall(expr_unwrapped) && operation(expr_unwrapped) == (+)
+        sub_args = arguments(expr_unwrapped)
+        arrayified_subs = map(sub_args) do sub
+            _arrayify_side(sub, s, depvars, deriv_vecs, derivweights,
+                indexmap, interior_idxs, coord_vecs, upwind_replacements)
+        end
+        # Sum the arrayified sub-terms
+        result = arrayified_subs[1]
+        for i in 2:length(arrayified_subs)
+            result = _broadcast_op(+, [result, arrayified_subs[i]])
+        end
+        return result
+    end
+
+    # Not an additive expression and not a matched upwind term — arrayify directly
+    return arrayify_expr(expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs)
 end
