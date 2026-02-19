@@ -1,3 +1,6 @@
+"""Cache for passing stencil data from `discretize_equation!` to `discretize`."""
+const _FAST_PATH_CACHE = Dict{UInt, Vector{Any}}()
+
 """
 Array-level equation discretization using stencil matrices.
 
@@ -34,6 +37,21 @@ function PDEBase.discretize_equation!(
 
     # Extract interior points
     interior = interiormap.I[pde]
+
+    # Cache stencil data for the fast numerical path in discretize()
+    cache_key = objectid(discretization)
+    is_fast_path = length(interior) > 0 && !needs_special_handling(pde, s, depvars, derivweights)
+    fast_entry = (
+        is_fast = is_fast_path,
+        stencil_matrices = is_fast_path ? stencil_matrices : nothing,
+        eqvar = eqvar,
+        discretespace = s,
+    )
+    if haskey(_FAST_PATH_CACHE, cache_key)
+        push!(_FAST_PATH_CACHE[cache_key], fast_entry)
+    else
+        _FAST_PATH_CACHE[cache_key] = Any[fast_entry]
+    end
 
     # Generate equations for all interior points
     eqs = if length(interior) == 0
