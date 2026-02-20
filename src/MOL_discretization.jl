@@ -153,7 +153,7 @@ function SciMLBase.discretize(
         return SciMLBase.discretize(pdesys, discretization, analytic)
     end
 
-    cache_key = objectid(discretization)
+    cache_key = UInt64(objectid(discretization))
 
     # Use PDEBase's default discretize pipeline (handles symbolic_discretize, mtkcompile,
     # ODEProblem creation, metadata, analytic functions — all correctly)
@@ -162,7 +162,9 @@ function SciMLBase.discretize(
                   pdesys, discretization; analytic = analytic, kwargs...)
 
     # Try to replace the ODE function with a fast sparse matvec
-    fast_path_data = pop!(_FAST_PATH_CACHE, cache_key, nothing)
+    fast_path_data = lock(_CACHE_LOCK) do
+        pop!(_FAST_PATH_CACHE, cache_key, nothing)
+    end
     if fast_path_data !== nothing && prob isa ODEProblem && all(d -> d.is_fast, fast_path_data)
         fast_prob = _try_build_fast_problem(prob, fast_path_data)
         if fast_prob !== nothing
@@ -189,56 +191,97 @@ The boundary correction is computed numerically by comparing `L_ii * u0` against
 Returns the fast ODEProblem, or `nothing` if the fast path is not applicable.
 """
 function _try_build_fast_problem(prob, fast_path_data)
-    # Only handle single-equation systems for now
-    length(fast_path_data) == 1 || return nothing
-    data = fast_path_data[1]
-    data.is_fast || return nothing
+    all(d -> d.is_fast, fast_path_data) || return nothing
+    n_total = length(prob.u0)
+    n_total == 0 && return nothing
 
-    s = data.discretespace
-    eqvar = data.eqvar
-    stencil_matrices = data.stencil_matrices
+    # Build block-diagonal stencil matrix for multi-variable systems
+    L_blocks = SparseMatrixCSC{Float64, Int}[]
+    total_interior = 0
 
-    # Get the dependent variable and its discretized grid variables
-    u_dep = depvar(eqvar, s)
-    haskey(s.discvars, u_dep) || return nothing
-    discvars = s.discvars[u_dep]
+    for data in fast_path_data
+        s = data.discretespace
+        eqvar = data.eqvar
+        stencil_matrices = data.stencil_matrices
 
-    # Only handle 1D for now (discvars is a Vector, not a Matrix)
-    discvars isa AbstractVector || return nothing
-    gridlen = length(discvars)
-    n = length(prob.u0)
-    n == 0 && return nothing
+        u_dep = depvar(eqvar, s)
+        haskey(s.discvars, u_dep) || return nothing
+        discvars = s.discvars[u_dep]
 
-    # Determine interior indices from grid size and problem size
-    # For Dirichlet BCs at both ends: n = gridlen - 2, interior = 2:gridlen-1
-    # For one BC: n = gridlen - 1
-    # For no BCs (periodic, etc.): n = gridlen
-    interior_indices = if n == gridlen - 2
-        collect(2:gridlen-1)
-    elseif n == gridlen
-        collect(1:gridlen)
-    else
-        return nothing  # unsupported BC configuration for fast path
+        # Only handle 1D for now (discvars is a Vector, not a Matrix)
+        discvars isa AbstractVector || return nothing
+        gridlen = length(discvars)
+
+        # Get stencil matrices for this variable
+        u_op = operation(u_dep)
+        haskey(stencil_matrices, u_op) || return nothing
+        u_matrices = stencil_matrices[u_op]
+
+        # Build combined stencil matrix (sum of all derivative operator matrices)
+        L_combined = spzeros(Float64, gridlen, gridlen)
+        for (_, mat_with_dim) in u_matrices
+            if mat_with_dim isa Tuple && mat_with_dim[1] isa Tuple
+                # Upwind derivatives: not supported in fast path yet
+                return nothing
+            elseif mat_with_dim isa Tuple && mat_with_dim[1] === :mixed
+                # Mixed derivatives: not supported in fast path yet
+                return nothing
+            end
+            L, _ = mat_with_dim
+            L_combined .+= L
+        end
+
+        push!(L_blocks, L_combined)
+        total_interior += gridlen
     end
 
-    # Get stencil matrices for this variable
-    u_op = operation(u_dep)
-    haskey(stencil_matrices, u_op) || return nothing
-    u_matrices = stencil_matrices[u_op]
+    # For multi-variable: the problem u0 has all interior DOFs concatenated
+    # Determine interior indices for each block
+    interior_blocks = Vector{Int}[]
+    offset = 0
+    for (i, data) in enumerate(fast_path_data)
+        s = data.discretespace
+        eqvar = data.eqvar
+        u_dep = depvar(eqvar, s)
+        discvars = s.discvars[u_dep]
+        gridlen = length(discvars)
+        n_block = gridlen  # full gridlen; we'll determine interior from prob.u0 size
 
-    # Build combined stencil matrix (sum of all derivative operator matrices)
-    L_combined = spzeros(Float64, gridlen, gridlen)
-    for (_, mat_with_dim) in u_matrices
-        if mat_with_dim[1] isa Tuple
-            # Upwind derivatives: not supported in fast path yet
+        push!(interior_blocks, collect(1:gridlen))
+    end
+
+    # For single-variable systems, use original logic to determine interior
+    if length(fast_path_data) == 1
+        gridlen = size(L_blocks[1], 1)
+        n = n_total
+
+        interior_indices = if n == gridlen - 2
+            collect(2:gridlen-1)
+        elseif n == gridlen
+            collect(1:gridlen)
+        else
             return nothing
         end
-        L, _ = mat_with_dim
-        L_combined .+= L
-    end
 
-    # Extract interior-interior submatrix
-    L_ii = L_combined[interior_indices, interior_indices]
+        L_ii = L_blocks[1][interior_indices, interior_indices]
+    else
+        # Multi-variable: build block-diagonal interior matrix
+        # Determine per-variable DOF count from ordering
+        # Heuristic: assume equal split or try common BC patterns
+        n_vars = length(fast_path_data)
+        gridlens = [size(L, 1) for L in L_blocks]
+
+        # Try: each variable has (gridlen - 2) interior points (Dirichlet both ends)
+        n_interior_per_var = [gl - 2 for gl in gridlens]
+        if sum(n_interior_per_var) == n_total
+            L_ii = blockdiag([L[2:end-1, 2:end-1] for L in L_blocks]...)
+        elseif sum(gridlens) == n_total
+            # No BCs stripped: periodic or all-Neumann
+            L_ii = blockdiag(L_blocks...)
+        else
+            return nothing  # can't determine interior structure
+        end
+    end
 
     # Compute boundary correction numerically:
     # For f(du, u, p, t) = L_full * u_full, we have

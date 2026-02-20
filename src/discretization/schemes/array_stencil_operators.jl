@@ -369,3 +369,257 @@ function build_stencil_matrices(s, depvars, derivweights, bcmap)
 
     return matrices
 end
+
+# ============================================================================
+# Half-offset stencil matrices for nonlinear Laplacian vectorization
+# ============================================================================
+
+"""
+    build_half_offset_stencil_matrix(D::DerivativeOperator, gridlen, bs, x)
+
+Build a sparse `(gridlen-1) × gridlen` matrix that maps values at `gridlen` grid points
+to derivative/interpolated values at `gridlen-1` half-offset points (x_{i+1/2}).
+
+Used for the inner derivative and interpolation in the nonlinear Laplacian
+`d/dx(a(x)*du/dx)`.
+
+For uniform grids (`DX <: Number`).
+"""
+function build_half_offset_stencil_matrix(
+        D::DerivativeOperator{T, N, Wind, DX}, gridlen, bs, x
+    ) where {T, N, Wind, DX <: Number}
+    haslower, hasupper = haslowerupper(bs, x)
+    half = div(D.stencil_length, 2)
+    n_half = gridlen - 1  # number of half-offset points
+
+    L = spzeros(T, n_half, gridlen)
+
+    for i in 1:n_half
+        if (i <= D.boundary_point_count) & !haslower
+            # Lower boundary stencil
+            weights = D.low_boundary_coefs[i]
+            offset = 1 - i
+            for k in 1:D.boundary_stencil_length
+                col = i + k - 1 + offset
+                if 1 <= col <= gridlen
+                    L[i, col] += weights[k]
+                end
+            end
+        elseif (i > n_half - D.boundary_point_count) & !hasupper
+            # Upper boundary stencil
+            bpc_idx = n_half - i
+            if bpc_idx >= 1 && bpc_idx <= length(D.high_boundary_coefs)
+                weights = D.high_boundary_coefs[bpc_idx]
+                offset = n_half - i
+                for k in 1:D.boundary_stencil_length
+                    col = i + k - D.boundary_stencil_length + offset
+                    if 1 <= col <= gridlen
+                        L[i, col] += weights[k]
+                    end
+                end
+            end
+        else
+            # Interior centered stencil at half-offset point i+1/2
+            weights = D.stencil_coefs
+            for (k, off) in enumerate((1 - half):half)
+                col = i + off
+                if length(bs) > 0
+                    col = mod1(col, gridlen)
+                end
+                if 1 <= col <= gridlen
+                    L[i, col] += weights[k]
+                end
+            end
+        end
+    end
+
+    return L
+end
+
+"""
+    build_half_offset_stencil_matrix(D::DerivativeOperator, gridlen, bs, x)
+
+Non-uniform grid variant for half-offset stencil matrix.
+"""
+function build_half_offset_stencil_matrix(
+        D::DerivativeOperator{T, N, Wind, DX}, gridlen, bs, x
+    ) where {T, N, Wind, DX <: AbstractVector}
+    @assert length(bs) == 0 "Interface boundary conditions are not yet supported for nonuniform dx dimensions."
+    half = div(D.stencil_length, 2)
+    n_half = gridlen - 1
+
+    L = spzeros(T, n_half, gridlen)
+
+    for i in 1:n_half
+        if i <= D.boundary_point_count
+            weights = D.low_boundary_coefs[i]
+            offset = 1 - i
+            for k in 1:D.boundary_stencil_length
+                col = i + k - 1 + offset
+                if 1 <= col <= gridlen
+                    L[i, col] += weights[k]
+                end
+            end
+        elseif i > n_half - D.boundary_point_count
+            bpc_idx = n_half - i
+            if bpc_idx >= 1 && bpc_idx <= length(D.high_boundary_coefs)
+                weights = D.high_boundary_coefs[bpc_idx]
+                offset = n_half - i
+                for k in 1:D.boundary_stencil_length
+                    col = i + k - D.boundary_stencil_length + offset
+                    if 1 <= col <= gridlen
+                        L[i, col] += weights[k]
+                    end
+                end
+            end
+        else
+            weights = D.stencil_coefs[i - D.boundary_point_count]
+            for (k, off) in enumerate((1 - half):half)
+                col = i + off
+                if 1 <= col <= gridlen
+                    L[i, col] += weights[k]
+                end
+            end
+        end
+    end
+
+    return L
+end
+
+"""
+    build_outer_half_offset_stencil_matrix(D::DerivativeOperator, gridlen, bs, x)
+
+Build a sparse `gridlen × (gridlen-1)` matrix that maps `gridlen-1` half-offset-point
+values back to `gridlen` grid-point derivative values.
+
+Used for the outer derivative in the nonlinear Laplacian `d/dx(a(x)*du/dx)`.
+The outer derivative maps flux values at half-points to the divergence at grid points.
+
+For uniform grids (`DX <: Number`).
+"""
+function build_outer_half_offset_stencil_matrix(
+        D::DerivativeOperator{T, N, Wind, DX}, gridlen, bs, x
+    ) where {T, N, Wind, DX <: Number}
+    haslower, hasupper = haslowerupper(bs, x)
+    half = div(D.stencil_length, 2)
+    n_half = gridlen - 1  # number of half-offset input points
+
+    L = spzeros(T, gridlen, n_half)
+
+    # The outer derivative: row i maps half-point values to the derivative at grid point i.
+    # We shift by -1 because the half-points are indexed 1..(N-1) corresponding to
+    # positions x_{1.5}, x_{2.5}, ..., x_{N-0.5}, and the outer stencil
+    # evaluates at half-points offset from this shifted indexing.
+    for i in 1:gridlen
+        # Shift index for the "cliplen" coordinate system (half-points as grid)
+        i_shifted = i - 1
+
+        if i_shifted < 1
+            # Grid point 1 is below the first half-point; use boundary stencil
+            if !haslower && 1 <= length(D.low_boundary_coefs)
+                weights = D.low_boundary_coefs[1]
+                for k in 1:min(D.boundary_stencil_length, n_half)
+                    if 1 <= k <= n_half
+                        L[i, k] += weights[k]
+                    end
+                end
+            end
+        elseif (i_shifted <= D.boundary_point_count) & !haslower
+            weights = D.low_boundary_coefs[i_shifted]
+            offset = 1 - i_shifted
+            for k in 1:D.boundary_stencil_length
+                col = i_shifted + k - 1 + offset
+                if 1 <= col <= n_half
+                    L[i, col] += weights[k]
+                end
+            end
+        elseif (i_shifted > n_half - D.boundary_point_count) & !hasupper
+            bpc_idx = n_half - i_shifted
+            if bpc_idx >= 1 && bpc_idx <= length(D.high_boundary_coefs)
+                weights = D.high_boundary_coefs[bpc_idx]
+                offset = n_half - i_shifted
+                for k in 1:D.boundary_stencil_length
+                    col = i_shifted + k - D.boundary_stencil_length + offset
+                    if 1 <= col <= n_half
+                        L[i, col] += weights[k]
+                    end
+                end
+            end
+        elseif i_shifted >= 1 && i_shifted <= n_half
+            # Interior stencil
+            weights = D.stencil_coefs
+            for (k, off) in enumerate((1 - half):half)
+                col = i_shifted + off
+                if length(bs) > 0
+                    col = mod1(col, n_half)
+                end
+                if 1 <= col <= n_half
+                    L[i, col] += weights[k]
+                end
+            end
+        end
+    end
+
+    return L
+end
+
+"""
+    build_outer_half_offset_stencil_matrix(D::DerivativeOperator, gridlen, bs, x)
+
+Non-uniform grid variant for outer half-offset stencil matrix.
+"""
+function build_outer_half_offset_stencil_matrix(
+        D::DerivativeOperator{T, N, Wind, DX}, gridlen, bs, x
+    ) where {T, N, Wind, DX <: AbstractVector}
+    @assert length(bs) == 0 "Interface boundary conditions are not yet supported for nonuniform dx dimensions."
+    half = div(D.stencil_length, 2)
+    n_half = gridlen - 1
+
+    L = spzeros(T, gridlen, n_half)
+
+    for i in 1:gridlen
+        i_shifted = i - 1
+
+        if i_shifted < 1
+            if 1 <= length(D.low_boundary_coefs)
+                weights = D.low_boundary_coefs[1]
+                for k in 1:min(D.boundary_stencil_length, n_half)
+                    if 1 <= k <= n_half
+                        L[i, k] += weights[k]
+                    end
+                end
+            end
+        elseif i_shifted <= D.boundary_point_count
+            weights = D.low_boundary_coefs[i_shifted]
+            offset = 1 - i_shifted
+            for k in 1:D.boundary_stencil_length
+                col = i_shifted + k - 1 + offset
+                if 1 <= col <= n_half
+                    L[i, col] += weights[k]
+                end
+            end
+        elseif i_shifted > n_half - D.boundary_point_count
+            bpc_idx = n_half - i_shifted
+            if bpc_idx >= 1 && bpc_idx <= length(D.high_boundary_coefs)
+                weights = D.high_boundary_coefs[bpc_idx]
+                offset = n_half - i_shifted
+                for k in 1:D.boundary_stencil_length
+                    col = i_shifted + k - D.boundary_stencil_length + offset
+                    if 1 <= col <= n_half
+                        L[i, col] += weights[k]
+                    end
+                end
+            end
+        elseif i_shifted >= 1 && i_shifted <= n_half
+            weights = D.stencil_coefs[i_shifted - D.boundary_point_count]
+            for (k, off) in enumerate((1 - half):half)
+                col = i_shifted + off
+                if 1 <= col <= n_half
+                    L[i, col] += weights[k]
+                end
+            end
+        end
+    end
+
+    return L
+end

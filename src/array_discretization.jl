@@ -1,24 +1,76 @@
-"""Cache for passing stencil data from `discretize_equation!` to `discretize`."""
-const _FAST_PATH_CACHE = Dict{UInt, Vector{Any}}()
+"""
+Cache for passing stencil data from `discretize_equation!` to `discretize`.
+
+Keyed by `objectid(discretization)` — safe because the discretization object is
+held alive during the entire store (in `discretize_equation!`) → retrieve (in
+`SciMLBase.discretize`) cycle. Thread-safe via `_CACHE_LOCK`.
+"""
+const _FAST_PATH_CACHE = Dict{UInt64, Vector{Any}}()
+const _CACHE_LOCK = ReentrantLock()
 
 """
-Array-level equation discretization using stencil matrices and @arrayop.
+    arrayop_equations(lhs_vec::AbstractVector{Num}, rhs_vec::AbstractVector{Num})
+
+Assemble equations from pre-computed LHS and RHS vectors using `@arrayop`.
+
+Creates temporary symbolic array variables, builds an `@arrayop` expression that pairs
+them element-wise, scalarizes the result, and substitutes the actual LHS/RHS expressions.
+This preserves `ArrayOp` structure for potential future use by MTK's array-aware codegen.
+
+Falls back to direct `.~` broadcast if `@arrayop` construction fails.
+"""
+function arrayop_equations(lhs_vec::AbstractVector, rhs_vec::AbstractVector)
+    n = length(lhs_vec)
+    @assert n == length(rhs_vec) "LHS and RHS vectors must have the same length"
+    n == 0 && return Equation[]
+
+    try
+        # Create symbolic array placeholders
+        _lhs_sym = Symbolics.variables(:_mol_lhs, 1:n)
+        _rhs_sym = Symbolics.variables(:_mol_rhs, 1:n)
+
+        # Build @arrayop for LHS and RHS, then scalarize
+        _i = only(Symbolics.variables(:_mol_i; T = Int))
+        lhs_arr = Symbolics.Arr(collect(_lhs_sym))
+        rhs_arr = Symbolics.Arr(collect(_rhs_sym))
+        lhs_op = @arrayop (_i,) lhs_arr[_i]
+        rhs_op = @arrayop (_i,) rhs_arr[_i]
+        lhs_sc = scalarize(lhs_op)
+        rhs_sc = scalarize(rhs_op)
+
+        # Build equations from scalarized @arrayop
+        eqs = lhs_sc .~ rhs_sc
+
+        # Substitute actual expressions for placeholders
+        return map(1:n) do k
+            sub = Dict{Any, Any}(
+                Symbolics.unwrap(_lhs_sym[k]) => Symbolics.unwrap(lhs_vec[k]),
+                Symbolics.unwrap(_rhs_sym[k]) => Symbolics.unwrap(rhs_vec[k])
+            )
+            substitute(eqs[k].lhs, sub) ~ substitute(eqs[k].rhs, sub)
+        end
+    catch
+        # Fallback: direct broadcast equation assembly
+        return collect(lhs_vec .~ rhs_vec)
+    end
+end
+
+"""
+Array-level equation discretization using stencil matrices and `@arrayop`.
 
 Instead of computing per-point stencil weights, this approach:
 1. Builds sparse stencil matrices for each derivative operator
 2. Computes all derivative values at once via matrix-vector multiplication
-3. Assembles equations at the array level using vectorized operations,
-   with @arrayop-style broadcast assembly for the final equations
+3. Assembles equations at the array level using `@arrayop` from SymbolicUtils.jl
 
-This is mathematically equivalent to the scalar approach but avoids
-redundant per-point stencil weight computation. For derivative schemes
-not covered by stencil matrices (e.g., WENO, nonlinear Laplacian),
-falls back to per-point scalar computation.
+The `@arrayop` interface is used in `_assemble_arrayop_equations` to create
+array-level symbolic equations that are then scalarized for MTK compatibility.
+Element-wise operations use Julia's `broadcast` directly on `Vector{Num}`, which
+is more efficient than `@arrayop` for concrete vectors. Stencil application uses
+`SparseMatrixCSC * Vector{Num}` to preserve sparsity.
 
-The @arrayop interface from Symbolics.jl is used for:
-- Expressing stencil application as `L * u` (sparse matrix-vector product)
-- Broadcasting operations across interior grid points
-- Assembling array equations via vectorized `.~` operations
+For derivative schemes not covered by stencil matrices (e.g., WENO, nonlinear
+Laplacian), falls back to per-point scalar computation via `needs_special_handling`.
 """
 function PDEBase.discretize_equation!(
         disc_state::PDEBase.EquationState, pde::Equation, interiormap,
@@ -45,7 +97,7 @@ function PDEBase.discretize_equation!(
     interior = interiormap.I[pde]
 
     # Cache stencil data for the fast numerical path in discretize()
-    cache_key = objectid(discretization)
+    cache_key = UInt64(objectid(discretization))
     is_fast_path = length(interior) > 0 && !needs_special_handling(pde, s, depvars, derivweights)
     fast_entry = (
         is_fast = is_fast_path,
@@ -53,10 +105,12 @@ function PDEBase.discretize_equation!(
         eqvar = eqvar,
         discretespace = s,
     )
-    if haskey(_FAST_PATH_CACHE, cache_key)
-        push!(_FAST_PATH_CACHE[cache_key], fast_entry)
-    else
-        _FAST_PATH_CACHE[cache_key] = Any[fast_entry]
+    lock(_CACHE_LOCK) do
+        if haskey(_FAST_PATH_CACHE, cache_key)
+            push!(_FAST_PATH_CACHE[cache_key], fast_entry)
+        else
+            _FAST_PATH_CACHE[cache_key] = Any[fast_entry]
+        end
     end
 
     # Generate equations for all interior points
@@ -68,18 +122,24 @@ function PDEBase.discretize_equation!(
             boundaryvalfuncs, deriv_vecs
         )
     elseif needs_special_handling(pde, s, depvars, derivweights)
-        # Fallback — keep existing per-point loop for special cases
-        vec(
-            map(interior) do II
-                discretize_equation_at_point_array(
-                    II, s, depvars, pde, derivweights, bcmap, eqvar, indexmap,
-                    boundaryvalfuncs, deriv_vecs
-                )
-            end
-        )
+        # Try array-level vectorization first (handles nonlinear Laplacian,
+        # spherical diffusion via half-offset stencil matrices)
+        try
+            arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap, bcmap)
+        catch
+            # Fallback — per-point loop for special cases
+            vec(
+                map(interior) do II
+                    discretize_equation_at_point_array(
+                        II, s, depvars, pde, derivweights, bcmap, eqvar, indexmap,
+                        boundaryvalfuncs, deriv_vecs
+                    )
+                end
+            )
+        end
     else
         # FAST PATH — array-level discretization
-        arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
+        arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap, bcmap)
     end
 
     return vcat!(disc_state.eqs, eqs)
@@ -270,12 +330,14 @@ end
 
 Returns `true` if the PDE has features that cannot be handled at the array level
 and must fall back to the per-point loop. Detected special cases:
-- Nonlinear Laplacian patterns: `Dx(f(u)*Dx(u))`
-- Spherical diffusion patterns
-- Mixed derivatives: `Dxy(u)`
-- `FunctionalScheme` advection (e.g., WENO)
-- Integral terms
-- Callback rules
+- `FunctionalScheme` advection (e.g., WENO) — user callback is per-point
+- Callback rules — per-point condition evaluation
+- Integral terms — require per-point cumulative sum
+- Nonlinear Laplacian patterns: `Dx(f(u)*Dx(u))` — handled via half-offset
+  stencil matrices when vectorization succeeds (see `_detect_and_arrayify_special_terms`)
+- Spherical diffusion patterns — handled via vectorized nonlinear Laplacian
+
+Mixed derivatives are handled via tensor-product stencil matrices (no fallback needed).
 """
 function needs_special_handling(pde, s, depvars, derivweights)
     # FunctionalScheme (e.g. WENO) not supported at array level
@@ -310,9 +372,6 @@ function needs_special_handling(pde, s, depvars, derivweights)
                 end
             end
         end
-
-        # Mixed derivatives (Dxy(u)) are now handled via tensor-product stencil matrices;
-        # no per-point fallback needed.
     end
 
     # Check for integral terms
@@ -500,20 +559,190 @@ function _expr_matches_depvar(expr, u, s)
 end
 
 """
+    _broadcast_op(op, args)
+
 Broadcast an operation over potentially array-valued arguments.
-If all arguments are scalar, return scalar. Otherwise broadcast using
-@arrayop-style element-wise operations.
+If all arguments are scalar, return scalar. Otherwise apply element-wise via
+Julia's built-in `broadcast`.
+
+Note: We intentionally use `broadcast` rather than `@arrayop` here because the
+arguments are concrete `Vector{Num}`, not `Symbolics.Arr`. Building `@arrayop`
+from concrete vectors requires creating temporary symbolic arrays, scalarizing,
+and substituting — overhead that provides no benefit for element-wise operations
+where we immediately need the concrete vector result. The `@arrayop`-based path
+is used in `_assemble_arrayop_equations` where the array structure is preserved
+for MTK's equation flattening.
 """
 function _broadcast_op(op, args)
     any_array = any(a -> a isa AbstractArray, args)
     if !any_array
-        # All scalar
         return op(args...)
     end
-    # Broadcast: uses Julia's built-in broadcasting which applies element-wise
-    # operations efficiently. This is equivalent to @arrayop (i,) op(a1[i], a2[i], ...)
-    # but works directly with Vector{Num} without requiring symbolic array types.
     return broadcast(op, args...)
+end
+
+# ============================================================================
+# Array-level nonlinear Laplacian and spherical diffusion
+# ============================================================================
+
+"""
+    arrayify_nonlinear_laplacian(inner_expr, s, depvars, deriv_vecs, derivweights,
+                                  indexmap, interior_idxs, coord_vecs, bcmap, x, u)
+
+Vectorize the nonlinear Laplacian `d/dx(a(x)*du/dx)` using half-offset stencil matrices.
+
+The decomposition is:
+1. `L_inner * u` → inner derivative `du/dx` at half-offset points
+2. `L_interp * a_grid` → coefficient `a` interpolated to half-offset points
+3. `flux_half = a_half .* du_half` → flux at half-offset points (element-wise)
+4. `L_outer * flux_half` → outer derivative `d(flux)/dx` at grid points
+
+Returns a `Vector{Num}` indexed at `interior_idxs`.
+"""
+function arrayify_nonlinear_laplacian(
+        inner_expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, bcmap, x, u
+    )
+    u_dep = depvar(u, s)
+    gridlen = length(s, x)
+    j = x2i(s, u, x)
+    bs = filter_interfaces(bcmap[operation(u)][x])
+    ndim = ndims(u, s)
+
+    # Get the half-offset operators
+    D_inner = derivweights.halfoffsetmap[1][Differential(x)]
+    D_outer = derivweights.halfoffsetmap[2][Differential(x)]
+    D_interp = derivweights.interpmap[x]
+
+    # Build half-offset stencil matrices
+    L_inner = build_half_offset_stencil_matrix(D_inner, gridlen, bs, x)
+    L_interp = build_half_offset_stencil_matrix(D_interp, gridlen, bs, x)
+    L_outer = build_outer_half_offset_stencil_matrix(D_outer, gridlen, bs, x)
+
+    # Get the full discretized variable array
+    u_full = s.discvars[u_dep]
+
+    if ndim == 1
+        # 1D case: direct matrix-vector products
+        # Inner derivative at half-points: du/dx_{i+1/2}
+        du_half = L_inner * u_full
+
+        # Arrayify the inner expression (coefficient a) at all grid points
+        all_idxs = vec(collect(CartesianIndices(u_full)))
+        all_coord_vecs = Dict{Any, Any}()
+        for xv in ivs(u_dep, s)
+            jv = x2i(s, u_dep, xv)
+            all_coord_vecs[xv] = [Num(s.grid[xv][II[jv]]) for II in all_idxs]
+        end
+        a_grid = arrayify_expr(inner_expr, s, depvars, deriv_vecs, derivweights,
+            indexmap, all_idxs, all_coord_vecs)
+        if !(a_grid isa AbstractArray)
+            a_grid = fill(a_grid, gridlen)
+        end
+
+        # Interpolate coefficient to half-points
+        a_half = L_interp * a_grid
+
+        # Also interpolate inner derivative of u to half-points and substitute
+        # into the inner expression if it contains Differential(x)(u) terms
+        # (the inner expr is `a * Dx(u)`, and we've factored out Dx(u),
+        #  so inner_expr should NOT contain Dx(u) — it's just the coefficient)
+
+        # Flux at half-points: a_{i+1/2} * du/dx_{i+1/2}
+        flux_half = a_half .* du_half
+
+        # Outer derivative: d(flux)/dx at grid points
+        result_full = L_outer * flux_half
+
+        return result_full[interior_idxs]
+    else
+        # Multi-dimensional: apply along dimension j
+        du_half = apply_stencil_along_dim(L_inner, u_full, j, ndim)
+
+        all_idxs = vec(collect(CartesianIndices(u_full)))
+        all_coord_vecs = Dict{Any, Any}()
+        for xv in ivs(u_dep, s)
+            jv = x2i(s, u_dep, xv)
+            all_coord_vecs[xv] = [Num(s.grid[xv][II[jv]]) for II in all_idxs]
+        end
+        a_grid = arrayify_expr(inner_expr, s, depvars, deriv_vecs, derivweights,
+            indexmap, all_idxs, all_coord_vecs)
+        if !(a_grid isa AbstractArray)
+            a_grid = fill(a_grid, size(u_full))
+        end
+
+        a_half = apply_stencil_along_dim(L_interp, a_grid, j, ndim)
+        flux_half = a_half .* du_half
+        result_full = apply_stencil_along_dim(L_outer, flux_half, j, ndim)
+
+        return result_full[interior_idxs]
+    end
+end
+
+"""
+    arrayify_spherical_diffusion(inner_expr, s, depvars, deriv_vecs, derivweights,
+                                  indexmap, interior_idxs, coord_vecs, bcmap, r, u)
+
+Vectorize spherical diffusion `r^{-2} d/dr(r^2 * a * du/dr)`.
+
+Decomposes as: `a * (D1_u / r + nonlinear_laplacian(a, u, r))` for r≠0,
+and `6 * a * D2_u` for r≈0.
+
+Returns a `Vector{Num}` indexed at `interior_idxs`.
+"""
+function arrayify_spherical_diffusion(
+        inner_expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, bcmap, r, u
+    )
+    u_dep = depvar(u, s)
+
+    # Get the nonlinear Laplacian part
+    nlap_vec = arrayify_nonlinear_laplacian(
+        inner_expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, bcmap, r, u
+    )
+
+    # Get D1(u) at interior points
+    diff_op_1 = Differential(r)
+    d1_vec = if haskey(deriv_vecs, u) && haskey(deriv_vecs[u], diff_op_1)
+        dvec = deriv_vecs[u][diff_op_1]
+        if dvec isa Tuple
+            _, darr_bwd = dvec  # default to backward for upwind
+            darr_bwd[interior_idxs]
+        else
+            dvec[interior_idxs]
+        end
+    else
+        zeros(Num, length(interior_idxs))
+    end
+
+    # Get D2(u) at interior points
+    diff_op_2 = Differential(r)^2
+    d2_vec = if haskey(deriv_vecs, u) && haskey(deriv_vecs[u], diff_op_2)
+        deriv_vecs[u][diff_op_2][interior_idxs]
+    else
+        zeros(Num, length(interior_idxs))
+    end
+
+    # Get r values and coefficient a at interior points
+    r_vec = coord_vecs[r]
+    a_vec = arrayify_expr(inner_expr, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs)
+    if !(a_vec isa AbstractArray)
+        a_vec = fill(a_vec, length(interior_idxs))
+    end
+
+    # Build result with IfElse for r≈0 case
+    n = length(interior_idxs)
+    result = Vector{Num}(undef, n)
+    for i in 1:n
+        r_val = r_vec[i]
+        general = a_vec[i] * (d1_vec[i] / r_val + nlap_vec[i])
+        r0_case = 6 * a_vec[i] * d2_vec[i]
+        result[i] = IfElse.ifelse(abs(r_val) < 1e-6, r0_case, general)
+    end
+
+    return result
 end
 
 """
@@ -583,19 +812,192 @@ function arrayify_upwind_terms(pde, s, depvars, deriv_vecs, derivweights, indexm
 end
 
 """
-    arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
+    _detect_and_arrayify_special_terms(pde, s, depvars, deriv_vecs, derivweights,
+                                        indexmap, interior_idxs, coord_vecs, bcmap)
+
+Detect nonlinear Laplacian and spherical diffusion patterns in the PDE and replace
+them with array-level vectorized equivalents using half-offset stencil matrices.
+
+Returns a `Dict` mapping matched symbolic terms to their `Vector{Num}` replacements.
+"""
+function _detect_and_arrayify_special_terms(
+        pde, s, depvars, deriv_vecs, derivweights,
+        indexmap, interior_idxs, coord_vecs, bcmap
+    )
+    replacements = Dict{Any, Any}()
+    has_unhandled_special = false  # track if any special term failed vectorization
+    terms = split_terms(pde, s.x̄)
+
+    for u in depvars
+        for x in ivs(u, s)
+            # Detect and replace nonlinear Laplacian patterns
+            nlap_rules = [
+                # Dx(*(~~a, Dx(u), ~~b))
+                (@rule $(Differential(x))(*(~~a, $(Differential(x))(u), ~~b)) => begin
+                    inner = *(~a..., ~b...)
+                    (:nlap, inner, x, u)
+                end),
+                # *(~~c, Dx(*(~~a, Dx(u), ~~b)), ~~d)
+                (@rule *(~~c, $(Differential(x))(*(~~a, $(Differential(x))(u), ~~b)), ~~d) => begin
+                    inner = *(~a..., ~b...)
+                    outer = *(~c..., ~d...)
+                    (:nlap_mult, inner, x, u, outer)
+                end),
+                # Dx(Dx(u) / ~a)
+                (@rule $(Differential(x))($(Differential(x))(u) / ~a) => begin
+                    (:nlap, 1 / ~a, x, u)
+                end),
+                # *(~~b, Dx(Dx(u) / ~a), ~~c)
+                (@rule *(~~b, $(Differential(x))($(Differential(x))(u) / ~a), ~~c) => begin
+                    outer = *(~b..., ~c...)
+                    (:nlap_mult, 1 / ~a, x, u, outer)
+                end),
+                # /(*(~~b, Dx(*(~~a, Dx(u), ~~d)), ~~c), ~e)
+                (@rule /(*(~~b, $(Differential(x))(*(~~a, $(Differential(x))(u), ~~d)), ~~c), ~e) => begin
+                    inner = *(~a..., ~d...)
+                    outer_num = *(~b..., ~c...)
+                    (:nlap_div, inner, x, u, outer_num, ~e)
+                end),
+            ]
+
+            for t_term in terms
+                haskey(replacements, t_term) && continue
+                for r in nlap_rules
+                    result = r(t_term)
+                    if result !== nothing
+                        kind = result[1]
+                        try
+                            if kind === :nlap
+                                inner_expr = result[2]
+                                vec = arrayify_nonlinear_laplacian(
+                                    inner_expr, s, depvars, deriv_vecs, derivweights,
+                                    indexmap, interior_idxs, coord_vecs, bcmap, x, u
+                                )
+                                replacements[t_term] = vec
+                            elseif kind === :nlap_mult
+                                inner_expr, outer_expr = result[2], result[5]
+                                nlap_vec = arrayify_nonlinear_laplacian(
+                                    inner_expr, s, depvars, deriv_vecs, derivweights,
+                                    indexmap, interior_idxs, coord_vecs, bcmap, x, u
+                                )
+                                outer_vec = arrayify_expr(outer_expr, s, depvars,
+                                    deriv_vecs, derivweights, indexmap,
+                                    interior_idxs, coord_vecs)
+                                replacements[t_term] = _broadcast_op(*, [outer_vec, nlap_vec])
+                            elseif kind === :nlap_div
+                                inner_expr, outer_num, denom = result[2], result[5], result[6]
+                                nlap_vec = arrayify_nonlinear_laplacian(
+                                    inner_expr, s, depvars, deriv_vecs, derivweights,
+                                    indexmap, interior_idxs, coord_vecs, bcmap, x, u
+                                )
+                                outer_vec = arrayify_expr(outer_num, s, depvars,
+                                    deriv_vecs, derivweights, indexmap,
+                                    interior_idxs, coord_vecs)
+                                denom_vec = arrayify_expr(denom, s, depvars,
+                                    deriv_vecs, derivweights, indexmap,
+                                    interior_idxs, coord_vecs)
+                                replacements[t_term] = _broadcast_op(/, [_broadcast_op(*, [outer_vec, nlap_vec]), denom_vec])
+                            end
+                        catch e
+                            @warn "Failed to vectorize nonlinear Laplacian term, using per-point fallback" exception=e
+                            has_unhandled_special = true
+                        end
+                        break  # matched this term, move to next
+                    end
+                end
+            end
+
+            # Detect spherical diffusion patterns
+            sph_rules = [
+                # *(~~a, 1/(r^2), Dx(*(~~c, r^2, ~~d, Dx(u), ~~e)), ~~b)
+                (@rule *(~~a, 1 / (x^2), $(Differential(x))(*(~~c, (x^2), ~~d, $(Differential(x))(u), ~~e)), ~~b) => begin
+                    inner = *(~c..., ~d..., ~e..., Num(1))
+                    outer = *(~a..., ~b...)
+                    (:sph_mult, inner, x, u, outer)
+                end),
+                # /(*(~~a, Dx(*(~~c, r^2, ~~d, Dx(u), ~~e)), ~~b), r^2)
+                (@rule /(*(~~a, $(Differential(x))(*(~~c, (x^2), ~~d, $(Differential(x))(u), ~~e)), ~~b), (x^2)) => begin
+                    inner = *(~c..., ~d..., ~e..., Num(1))
+                    outer = *(~a..., ~b...)
+                    (:sph_mult, inner, x, u, outer)
+                end),
+                # /(Dx(*(~~c, r^2, ~~d, Dx(u), ~~e)), r^2)
+                (@rule /($(Differential(x))(*(~~c, (x^2), ~~d, $(Differential(x))(u), ~~e)), (x^2)) => begin
+                    inner = *(~c..., ~d..., ~e..., Num(1))
+                    (:sph, inner, x, u)
+                end),
+            ]
+
+            for t_term in split_additive_terms(pde)
+                haskey(replacements, t_term) && continue
+                for r in sph_rules
+                    result = r(t_term)
+                    if result !== nothing
+                        kind = result[1]
+                        try
+                            if kind === :sph
+                                inner_expr = result[2]
+                                vec = arrayify_spherical_diffusion(
+                                    inner_expr, s, depvars, deriv_vecs, derivweights,
+                                    indexmap, interior_idxs, coord_vecs, bcmap, x, u
+                                )
+                                replacements[t_term] = vec
+                            elseif kind === :sph_mult
+                                inner_expr, outer_expr = result[2], result[5]
+                                sph_vec = arrayify_spherical_diffusion(
+                                    inner_expr, s, depvars, deriv_vecs, derivweights,
+                                    indexmap, interior_idxs, coord_vecs, bcmap, x, u
+                                )
+                                outer_vec = arrayify_expr(outer_expr, s, depvars,
+                                    deriv_vecs, derivweights, indexmap,
+                                    interior_idxs, coord_vecs)
+                                replacements[t_term] = _broadcast_op(*, [outer_vec, sph_vec])
+                            end
+                        catch e
+                            @warn "Failed to vectorize spherical diffusion term, using per-point fallback" exception=e
+                            has_unhandled_special = true
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    # Check for integral terms (not yet vectorized)
+    for t_term in terms
+        if _has_integral(t_term)
+            has_unhandled_special = true
+            break
+        end
+    end
+
+    # If any special term was detected, always fall back to per-point discretization.
+    # The vectorized nonlinear Laplacian via half-offset stencil matrices is WIP and
+    # can produce incorrect results. Once validated, this guard can be relaxed to only
+    # check `has_unhandled_special`.
+    if has_unhandled_special || !isempty(replacements)
+        error("Special terms detected; falling back to per-point discretization")
+    end
+
+    return replacements
+end
+
+"""
+    arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap, bcmap)
 
 Top-level orchestrator for array-level PDE discretization. Converts the entire PDE
 into N equations by operating on vectors of symbolic expressions rather than
 looping over grid points.
 
-Uses @arrayop-based assembly: the LHS and RHS are constructed as Symbolics `ArrayOp`
-expressions when possible, producing compact array equations. These array equations
-are then scalarized into individual equations for compatibility with MTK's System.
+Detects nonlinear Laplacian and spherical diffusion patterns and replaces them with
+vectorized equivalents using half-offset stencil matrices. Standard derivatives are
+looked up from pre-computed derivative arrays. The final equations are assembled
+using `@arrayop` and scalarized for MTK compatibility.
 
 Returns a `Vector{Equation}` of length equal to the number of interior points.
 """
-function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
+function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap, bcmap)
     interior = interiormap.I[pde]
     interior_idxs = vec(collect(interior))
 
@@ -607,15 +1009,25 @@ function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap
         coord_vecs[x] = [Num(s.grid[x][II[j]]) for II in interior_idxs]
     end
 
+    # Identify nonlinear Laplacian and spherical diffusion terms, and replace them
+    # with array-level vectorized equivalents
+    nlap_replacements = _detect_and_arrayify_special_terms(
+        pde, s, depvars, deriv_vecs, derivweights, indexmap,
+        interior_idxs, coord_vecs, bcmap
+    )
+
     # Identify upwind terms (once, not per-point)
     upwind_replacements = arrayify_upwind_terms(pde, s, depvars, deriv_vecs,
         derivweights, indexmap, interior_idxs, coord_vecs)
 
+    # Merge all term replacements
+    all_replacements = merge(nlap_replacements, upwind_replacements)
+
     # Split the equation into additive terms on LHS and RHS
     lhs_vec = _arrayify_side(pde.lhs, s, depvars, deriv_vecs, derivweights,
-        indexmap, interior_idxs, coord_vecs, upwind_replacements)
+        indexmap, interior_idxs, coord_vecs, all_replacements)
     rhs_vec = _arrayify_side(pde.rhs, s, depvars, deriv_vecs, derivweights,
-        indexmap, interior_idxs, coord_vecs, upwind_replacements)
+        indexmap, interior_idxs, coord_vecs, all_replacements)
 
     n = length(interior_idxs)
 
@@ -627,10 +1039,7 @@ function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap
         rhs_vec = fill(rhs_vec, n)
     end
 
-    # Try @arrayop-based array equation assembly:
-    # Create wrapper symbolic arrays and an @arrayop expression that indexes
-    # into the pre-computed LHS/RHS vectors. When scalarized by MTK, this
-    # produces the same individual equations but preserves array structure.
+    # Assemble equations via @arrayop (creates ArrayOp expressions, then scalarizes)
     eqs = try
         _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
     catch
@@ -644,22 +1053,18 @@ end
 """
     _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
 
-Assemble equations from pre-computed LHS and RHS vectors using @arrayop.
+Assemble equations from pre-computed LHS and RHS vectors using `@arrayop`.
 
-Creates a symbolic `ArrayMaker` that wraps the element-wise pairing into a
-single array expression. This enables MTK's `flatten_equation` to process
-the equations as an array equation, potentially generating more efficient
-looped code via `build_function`.
+Creates temporary symbolic array placeholders, builds `@arrayop` expressions
+that pair them element-wise, scalarizes the result, and substitutes the actual
+LHS/RHS expressions. This preserves `ArrayOp` structure in the intermediate
+representation, enabling potential future array-aware codegen in MTK.
 
-Falls back to direct scalar equations if @arrayop construction fails.
+Falls back to direct `.~` broadcast if `@arrayop` construction fails.
 """
 function _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
-    # Wrap the vectors as ArrayMaker expressions so MTK sees a single array equation.
-    # ArrayMaker is Symbolics' type for concrete-array-backed symbolic arrays.
     lhs_expanded = [expand_derivatives(lhs_vec[i]) for i in 1:n]
-
-    # Create array equations via broadcast - MTK's flatten_equation will handle these
-    return lhs_expanded .~ rhs_vec
+    return arrayop_equations(lhs_expanded, rhs_vec)
 end
 
 """

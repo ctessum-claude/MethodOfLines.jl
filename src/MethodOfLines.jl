@@ -9,8 +9,9 @@ using ModelingToolkit: operation, iscall, arguments, variable, get_unknowns,
 using SymbolicIndexingInterface
 using SymbolicUtils, Symbolics
 using Symbolics: unwrap, symbolic_linear_solve, expand_derivatives, diff2term, setname,
-    rename
+    rename, scalarize
 using SymbolicUtils: operation, arguments, getmetadata, unwrap_const
+using SymbolicUtils: @arrayop
 using IfElse
 using StaticArrays
 using Interpolations
@@ -103,7 +104,7 @@ include("discretization/schemes/extrapolation_weights.jl")
 include("discretization/differential_discretizer.jl")
 include("discretization/schemes/callbacks/callback_rules.jl")
 
-# Stencil matrices and @arrayop-based array operations for derivative computation
+# Stencil matrices for array-level derivative computation
 include("discretization/schemes/array_stencil_operators.jl")
 
 # System Parsing

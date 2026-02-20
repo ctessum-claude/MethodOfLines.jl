@@ -48,12 +48,10 @@ function generate_bc_eqs!(
     disc1 = s.discvars[depvar(u_, s)]
     disc2 = s.discvars[depvar(u__, s)]
 
+    edge_indices = vec(collect(edge(s, boundary, interiormap)))
     return vcat!(
-        disc_state.bceqs, vec(
-            map(edge(s, boundary, interiormap)) do II
-                disc1[II] ~ disc2[II + Ioffset]
-            end
-        )
+        disc_state.bceqs,
+        disc1[edge_indices] .~ disc2[edge_indices .+ Ref(Ioffset)]
     )
 end
 

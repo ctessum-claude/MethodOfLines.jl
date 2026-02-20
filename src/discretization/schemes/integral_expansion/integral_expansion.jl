@@ -1,39 +1,73 @@
-# use the trapezoid rule
-function _euler_integral(II, s, jx, u, ufunc, dx::Number) #where {T,N,Wind,DX<:Number}
+# Iterative trapezoidal rule (uniform grid)
+function _euler_integral(II, s, jx, u, ufunc, dx::Number)
     j, x = jx
     if II[j] == 1
         return Num(0)
     end
-    # unit index in direction of the derivative
     I1 = unitindex(ndims(u, s), j)
-    # dx for multiplication
-    Itap = [II - I1, II]
-    weights = [dx / 2, dx / 2]
-
-    return sym_dot(weights, ufunc(u, Itap, x)) +
-        _euler_integral(II - I1, s, jx, u, ufunc, dx)
+    # Iterative cumulative trapezoid from index 1 to II[j]
+    result = Num(0)
+    Icur = II - I1 * (II[j] - 1)  # start at index 1
+    for k in 2:II[j]
+        Iprev = Icur
+        Icur = Iprev + I1
+        result = result + (dx / 2) * (ufunc(u, [Iprev], x)[1] + ufunc(u, [Icur], x)[1])
+    end
+    return result
 end
 
-# Nonuniform dx
-function _euler_integral(II, s, jx, u, ufunc, dx::AbstractVector) #where {T,N,Wind,DX<:Number}
+# Iterative trapezoidal rule (nonuniform grid)
+function _euler_integral(II, s, jx, u, ufunc, dx::AbstractVector)
     j, x = jx
     if II[j] == 1
         return Num(0)
     end
-    # unit index in direction of the derivative
     I1 = unitindex(ndims(u, s), j)
-    # dx for multiplication
-    Itap = [II - I1, II]
-    weights = fill(dx[II[j] - 1] / 2, 2)
-
-    return sym_dot(weights, ufunc(u, Itap, x)) +
-        _euler_integral(II - I1, s, jx, u, ufunc, dx)
+    result = Num(0)
+    Icur = II - I1 * (II[j] - 1)  # start at index 1
+    for k in 2:II[j]
+        Iprev = Icur
+        Icur = Iprev + I1
+        dxk = dx[k - 1]
+        result = result + (dxk / 2) * (ufunc(u, [Iprev], x)[1] + ufunc(u, [Icur], x)[1])
+    end
+    return result
 end
 
 function euler_integral(II, s, jx, u, ufunc)
     j, x = jx
     dx = s.dxs[x]
     return _euler_integral(II, s, jx, u, ufunc, dx)
+end
+
+"""
+    euler_integral_array(s, jx, u, ufunc)
+
+Compute the cumulative trapezoidal integral along dimension `j` for all grid points
+at once, returning a vector of symbolic expressions. This avoids redundant work
+compared to calling `euler_integral` per point.
+"""
+function euler_integral_array(s, jx, u, ufunc)
+    j, x = jx
+    dx = s.dxs[x]
+    n = length(s, x)
+    I1 = unitindex(ndims(u, s), j)
+
+    # Build array of u values at each grid point along dimension j
+    # For 1D this is straightforward; for multi-D we'd need to handle slices
+    result = Vector{Num}(undef, n)
+    result[1] = Num(0)
+    for k in 2:n
+        dxk = dx isa Number ? dx : dx[k - 1]
+        # Construct indices for points k-1 and k
+        # Use a reference CartesianIndex with just the j-th component varying
+        Iprev = CartesianIndex(ntuple(d -> d == j ? k - 1 : 1, ndims(u, s)))
+        Icur = CartesianIndex(ntuple(d -> d == j ? k : 1, ndims(u, s)))
+        result[k] = result[k - 1] + (dxk / 2) * (
+            ufunc(u, [Iprev], x)[1] + ufunc(u, [Icur], x)[1]
+        )
+    end
+    return result
 end
 
 # An integral across the whole domain (xmin .. xmax)

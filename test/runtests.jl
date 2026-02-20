@@ -9,6 +9,9 @@ const is_TRAVIS = haskey(ENV, "TRAVIS")
 
 @time begin
     if GROUP == "All" || GROUP == "Components"
+        @time @safetestset "@arrayop infrastructure" begin
+            include("components/arrayop_test.jl")
+        end
         @time @safetestset "MOLFiniteDifference Utils" begin
             include("utils_test.jl")
         end
