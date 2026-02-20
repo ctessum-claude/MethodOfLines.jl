@@ -202,6 +202,11 @@ Apply a stencil matrix `L` along dimension `j` of a multi-dimensional symbolic a
 For 1D: `L * u_vec` (standard matrix-vector product)
 For 2D, dim 1: `L * u_mat` (applies to each column)
 For 2D, dim 2: `u_mat * transpose(L)` (applies to each row)
+For 3D+: reshape to 2D, apply along the target dimension, reshape back.
+
+The general strategy for ndim ≥ 3 is to permute dimension `j` to the front,
+reshape into a 2D matrix (first dim = j, second dim = product of all others),
+apply `L * reshaped`, and undo the permutation.
 """
 function apply_stencil_along_dim(L, u_scalarized, j, ndim)
     if ndim <= 1
@@ -213,7 +218,19 @@ function apply_stencil_along_dim(L, u_scalarized, j, ndim)
             return u_scalarized * transpose(L)
         end
     else
-        error("Stencil matrices for >2 spatial dimensions not yet supported, got ndim=$ndim")
+        # General N-dimensional case:
+        # Move dimension j to the front, flatten remaining dims, apply L, unflatten, permute back.
+        sz = size(u_scalarized)
+        perm = vcat(j, setdiff(1:ndim, j))
+        iperm = invperm(perm)
+
+        u_perm = permutedims(u_scalarized, perm)
+        nj = sz[j]
+        nrest = prod(sz[k] for k in 1:ndim if k != j)
+        u_2d = reshape(u_perm, nj, nrest)
+        result_2d = L * u_2d
+        result_perm = reshape(result_2d, size(L, 1), size(u_perm)[2:end]...)
+        return permutedims(result_perm, iperm)
     end
 end
 
@@ -245,7 +262,13 @@ function compute_derivative_vectors(stencil_matrices, s, depvars)
         ndim = ndims(u, s)
 
         for (diff_op, mat_with_dim) in u_matrices
-            if mat_with_dim[1] isa Tuple
+            if mat_with_dim isa Tuple && mat_with_dim[1] === :mixed
+                # Mixed derivative: (:mixed, Lx, jx, Ly, jy)
+                _, Lx, jx, Ly, jy = mat_with_dim
+                # Apply Ly along dim jy first, then Lx along dim jx: Lx * (Ly * u) = Dxy(u)
+                tmp = apply_stencil_along_dim(Ly, u_scalarized, jy, ndim)
+                u_dvecs[diff_op] = apply_stencil_along_dim(Lx, tmp, jx, ndim)
+            elseif mat_with_dim isa Tuple && mat_with_dim[1] isa Tuple
                 # Upwind: ((L_fwd, L_bwd), j)
                 (L_fwd, L_bwd), j = mat_with_dim
                 dvec_fwd = apply_stencil_along_dim(L_fwd, u_scalarized, j, ndim)
@@ -269,6 +292,7 @@ Build all stencil matrices for all dependent variables and derivative orders.
 Returns a nested dictionary:
   `matrices[uop][Differential(x)^d] => (L, j)` for centered derivatives
   `matrices[uop][Differential(x)^d] => ((L_fwd, L_bwd), j)` for upwind derivatives
+  `matrices[uop][Differential(x)*Differential(y)] => (:mixed, Lx, jx, Ly, jy)` for mixed derivatives
 
 where `j` is the spatial dimension index that the stencil operates on.
 """
@@ -305,6 +329,37 @@ function build_stencil_matrices(s, depvars, derivweights, bcmap)
                     L_bwd = build_upwind_stencil_matrix(D_bwd, gridlen, bs, x, false)
 
                     u_matrices[Differential(x)^d] = ((L_fwd, L_bwd), j)
+                end
+            end
+        end
+
+        # Mixed derivatives: Dx*Dy(u) for all pairs of spatial variables
+        # Uses first-order stencil matrices applied sequentially: Lx along dim x, then Ly along dim y
+        spatial_vars = collect(ivs(u, s))
+        for (ix, x) in enumerate(spatial_vars)
+            for (iy, y) in enumerate(spatial_vars)
+                isequal(x, y) && continue
+                # Only build for x < y to avoid duplicate pairs (Dxy = Dyx)
+                ix >= iy && continue
+
+                mixed_op = Differential(x) * Differential(y)
+
+                # Build first-order centered stencil matrices for x and y
+                # Use the centered difference operator for first derivative (map stores Differential(x)^1)
+                if haskey(derivweights.map, Differential(x)) && haskey(derivweights.map, Differential(y))
+                    D_x = derivweights.map[Differential(x)]
+                    D_y = derivweights.map[Differential(y)]
+                    gridlen_x = length(s, x)
+                    gridlen_y = length(s, y)
+                    bs_x = filter_interfaces(bcmap[uop][x])
+                    bs_y = filter_interfaces(bcmap[uop][y])
+                    jx = x2i(s, u, x)
+                    jy = x2i(s, u, y)
+                    Lx = build_centered_stencil_matrix(D_x, gridlen_x, bs_x, x)
+                    Ly = build_centered_stencil_matrix(D_y, gridlen_y, bs_y, y)
+                    u_matrices[mixed_op] = (:mixed, Lx, jx, Ly, jy)
+                    # Also store the reverse order for Dy*Dx lookups
+                    u_matrices[Differential(y) * Differential(x)] = (:mixed, Ly, jy, Lx, jx)
                 end
             end
         end

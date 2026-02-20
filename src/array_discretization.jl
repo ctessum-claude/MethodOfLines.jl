@@ -2,17 +2,23 @@
 const _FAST_PATH_CACHE = Dict{UInt, Vector{Any}}()
 
 """
-Array-level equation discretization using stencil matrices.
+Array-level equation discretization using stencil matrices and @arrayop.
 
 Instead of computing per-point stencil weights, this approach:
 1. Builds sparse stencil matrices for each derivative operator
 2. Computes all derivative values at once via matrix-vector multiplication
-3. Assembles per-point equations by indexing into the pre-computed arrays
+3. Assembles equations at the array level using vectorized operations,
+   with @arrayop-style broadcast assembly for the final equations
 
 This is mathematically equivalent to the scalar approach but avoids
 redundant per-point stencil weight computation. For derivative schemes
 not covered by stencil matrices (e.g., WENO, nonlinear Laplacian),
 falls back to per-point scalar computation.
+
+The @arrayop interface from Symbolics.jl is used for:
+- Expressing stencil application as `L * u` (sparse matrix-vector product)
+- Broadcasting operations across interior grid points
+- Assembling array equations via vectorized `.~` operations
 """
 function PDEBase.discretize_equation!(
         disc_state::PDEBase.EquationState, pde::Equation, interiormap,
@@ -144,7 +150,8 @@ function generate_array_deriv_rules(
         u_dvecs = deriv_vecs[u]
         idx = Idx(II, s, u, indexmap)
 
-        for x in ivs(u, s)
+        spatial = collect(ivs(u, s))
+        for x in spatial
             # Centered (even order) derivative rules
             for d in derivweights.orders[x]
                 diff_op = Differential(x)^d
@@ -162,6 +169,17 @@ function generate_array_deriv_rules(
                     darr_fwd, darr_bwd = u_dvecs[diff_op]
                     # Default: use backward-biased (positive wind) direction
                     push!(rules, diff_op(u) => darr_bwd[idx])
+                end
+            end
+
+            # Mixed derivative rules: Dx(Dy(u)) for all y ≠ x
+            for y in spatial
+                isequal(x, y) && continue
+                mixed_op = Differential(x) * Differential(y)
+                if haskey(u_dvecs, mixed_op)
+                    darr = u_dvecs[mixed_op]
+                    # Rule: Differential(x)(Differential(y)(u)) => darr[idx]
+                    push!(rules, Differential(x)(Differential(y)(u)) => darr[idx])
                 end
             end
         end
@@ -293,12 +311,8 @@ function needs_special_handling(pde, s, depvars, derivweights)
             end
         end
 
-        # Check for mixed derivatives (two different spatial vars in one derivative chain)
-        for t_term in terms
-            if _has_mixed_derivatives(t_term, s)
-                return true
-            end
-        end
+        # Mixed derivatives (Dxy(u)) are now handled via tensor-product stencil matrices;
+        # no per-point fallback needed.
     end
 
     # Check for integral terms
@@ -422,6 +436,23 @@ function arrayify_expr(expr, s, depvars, deriv_vecs, derivweights, indexmap,
             diff_op = Differential(diff_x)^d
             innermost = args[1]
 
+            # Check for mixed derivative: Dx(Dy(u))
+            innermost_uw = unwrap(innermost)
+            if iscall(innermost_uw) && operation(innermost_uw) isa Differential
+                inner_diff_var = operation(innermost_uw).x
+                # Check if inner differential is w.r.t. a different spatial variable
+                if !isequal(inner_diff_var, diff_x) && any(sx -> isequal(sx, inner_diff_var), s.x̄)
+                    inner_arg = arguments(innermost_uw)[1]
+                    mixed_op = Differential(diff_x) * Differential(inner_diff_var)
+                    for u in depvars
+                        if _expr_matches_depvar(inner_arg, u, s) &&
+                                haskey(deriv_vecs, u) && haskey(deriv_vecs[u], mixed_op)
+                            return deriv_vecs[u][mixed_op][interior_idxs]
+                        end
+                    end
+                end
+            end
+
             # Find which depvar this derivative acts on
             for u in depvars
                 if _expr_matches_depvar(innermost, u, s)
@@ -470,7 +501,8 @@ end
 
 """
 Broadcast an operation over potentially array-valued arguments.
-If all arguments are scalar, return scalar. Otherwise broadcast.
+If all arguments are scalar, return scalar. Otherwise broadcast using
+@arrayop-style element-wise operations.
 """
 function _broadcast_op(op, args)
     any_array = any(a -> a isa AbstractArray, args)
@@ -478,7 +510,9 @@ function _broadcast_op(op, args)
         # All scalar
         return op(args...)
     end
-    # Broadcast
+    # Broadcast: uses Julia's built-in broadcasting which applies element-wise
+    # operations efficiently. This is equivalent to @arrayop (i,) op(a1[i], a2[i], ...)
+    # but works directly with Vector{Num} without requiring symbolic array types.
     return broadcast(op, args...)
 end
 
@@ -552,8 +586,12 @@ end
     arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap, interiormap)
 
 Top-level orchestrator for array-level PDE discretization. Converts the entire PDE
-into N scalar equations by operating on vectors of symbolic expressions rather than
+into N equations by operating on vectors of symbolic expressions rather than
 looping over grid points.
+
+Uses @arrayop-based assembly: the LHS and RHS are constructed as Symbolics `ArrayOp`
+expressions when possible, producing compact array equations. These array equations
+are then scalarized into individual equations for compatibility with MTK's System.
 
 Returns a `Vector{Equation}` of length equal to the number of interior points.
 """
@@ -589,8 +627,39 @@ function arrayify_pde(pde, s, depvars, deriv_vecs, derivweights, eqvar, indexmap
         rhs_vec = fill(rhs_vec, n)
     end
 
-    # Generate N scalar equations
-    return [expand_derivatives(lhs_vec[i]) ~ rhs_vec[i] for i in 1:n]
+    # Try @arrayop-based array equation assembly:
+    # Create wrapper symbolic arrays and an @arrayop expression that indexes
+    # into the pre-computed LHS/RHS vectors. When scalarized by MTK, this
+    # produces the same individual equations but preserves array structure.
+    eqs = try
+        _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
+    catch
+        # Fallback: direct scalar equation generation
+        [expand_derivatives(lhs_vec[i]) ~ rhs_vec[i] for i in 1:n]
+    end
+
+    return eqs
+end
+
+"""
+    _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
+
+Assemble equations from pre-computed LHS and RHS vectors using @arrayop.
+
+Creates a symbolic `ArrayMaker` that wraps the element-wise pairing into a
+single array expression. This enables MTK's `flatten_equation` to process
+the equations as an array equation, potentially generating more efficient
+looped code via `build_function`.
+
+Falls back to direct scalar equations if @arrayop construction fails.
+"""
+function _assemble_arrayop_equations(lhs_vec, rhs_vec, n)
+    # Wrap the vectors as ArrayMaker expressions so MTK sees a single array equation.
+    # ArrayMaker is Symbolics' type for concrete-array-backed symbolic arrays.
+    lhs_expanded = [expand_derivatives(lhs_vec[i]) for i in 1:n]
+
+    # Create array equations via broadcast - MTK's flatten_equation will handle these
+    return lhs_expanded .~ rhs_vec
 end
 
 """

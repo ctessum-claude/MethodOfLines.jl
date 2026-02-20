@@ -103,7 +103,7 @@ include("discretization/schemes/extrapolation_weights.jl")
 include("discretization/differential_discretizer.jl")
 include("discretization/schemes/callbacks/callback_rules.jl")
 
-# Array-level stencil operators for @arrayop discretization
+# Stencil matrices and @arrayop-based array operations for derivative computation
 include("discretization/schemes/array_stencil_operators.jl")
 
 # System Parsing
