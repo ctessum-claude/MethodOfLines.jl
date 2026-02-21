@@ -148,4 +148,9 @@ const is_TRAVIS = haskey(ENV, "TRAVIS")
             include("pde_systems/wave_eq_staggered.jl")
         end
     end
+    if GROUP == "All" || GROUP == "Checks_Kwarg"
+        @time @safetestset "MOLFiniteDifference Interface: checks kwarg" begin
+            include("pde_systems/MOL_checks_kwarg.jl")
+        end
+    end
 end
